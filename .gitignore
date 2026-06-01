@@ -8,3 +8,8 @@ server/data/*.db
 server/data/*.db-*
 .env
 .env.local
+
+# Claude Code
+.claude/
+.agents/
+skills-lock.json

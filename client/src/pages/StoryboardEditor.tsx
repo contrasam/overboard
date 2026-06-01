@@ -80,6 +80,26 @@ export default function StoryboardEditor() {
     return m;
   }, [segments]);
 
+  // Active shot/audio under the playhead — must be before early return (Rules of Hooks)
+  const activeShotId = useMemo(() => {
+    if (!sb) return null;
+    let acc = 0;
+    for (const s of sb.shots) {
+      acc += s.durationSec;
+      if (playSec < acc) return s.id;
+    }
+    return null;
+  }, [sb, playSec]);
+
+  const activeAudioIds = useMemo(() => {
+    if (!sb) return new Set<string>();
+    const set = new Set<string>();
+    for (const m of sb.audioMarkers) {
+      if (playSec >= m.startSec && playSec < m.endSec) set.add(m.id);
+    }
+    return set;
+  }, [sb, playSec]);
+
   if (loading || !sb) {
     return <div className="empty">Loading…</div>;
   }
@@ -152,24 +172,6 @@ export default function StoryboardEditor() {
     setSelectedAudioId(null);
   };
 
-  // Active shot/audio under the playhead
-  const activeShotId = useMemo(() => {
-    let acc = 0;
-    for (const s of sb.shots) {
-      acc += s.durationSec;
-      if (playSec < acc) return s.id;
-    }
-    return null;
-  }, [sb.shots, playSec]);
-
-  const activeAudioIds = useMemo(() => {
-    const set = new Set<string>();
-    for (const m of sb.audioMarkers) {
-      if (playSec >= m.startSec && playSec < m.endSec) set.add(m.id);
-    }
-    return set;
-  }, [sb.audioMarkers, playSec]);
-
   const selectedShot = sb.shots.find((s) => s.id === selectedShotId) ?? null;
   const selectedAudio = sb.audioMarkers.find((m) => m.id === selectedAudioId) ?? null;
 
@@ -216,7 +218,7 @@ export default function StoryboardEditor() {
   return (
     <div className="editor">
       <div className="editor-head">
-        <Link to="/" className="btn ghost">← Storyboards</Link>
+        <Link to="/app" className="btn ghost">← Storyboards</Link>
         <input
           className="name"
           value={sb.name}
@@ -226,24 +228,21 @@ export default function StoryboardEditor() {
         />
         <span className="meta">{total.toFixed(1)}s · {sb.shots.length} shots · {sb.audioMarkers.length} audio</span>
         <div className="spacer" />
-        <label className="meta">px/sec
+        <label className="editor-setting">px/sec
           <input
             type="number" min={5} max={400} value={sb.pxPerSecond}
-            style={{ width: 70, marginLeft: 6 }}
             onChange={(e) => updateSettings({ pxPerSecond: Number(e.target.value) })}
           />
         </label>
-        <label className="meta">row width
+        <label className="editor-setting">row&nbsp;width
           <input
             type="number" min={400} max={4000} step={50} value={sb.rowWidthPx}
-            style={{ width: 80, marginLeft: 6 }}
             onChange={(e) => updateSettings({ rowWidthPx: Number(e.target.value) })}
           />
         </label>
-        <label className="meta">lanes
+        <label className="editor-setting">lanes
           <input
             type="number" min={1} max={8} value={sb.laneCount}
-            style={{ width: 50, marginLeft: 6 }}
             onChange={(e) => updateSettings({ laneCount: Number(e.target.value) })}
           />
         </label>
@@ -269,15 +268,17 @@ export default function StoryboardEditor() {
           rows.map((row) => {
             const playInRow = playSec >= row.startSec && playSec <= row.endSec;
             const playX = playInRow ? rowSecToX(row, playSec) : -9999;
+            {/* N shots have 1 leading + (N-1) between drop targets = N × 8px extra */}
+            const laneW = row.widthPx + row.shots.length * 8;
             return (
-              <div key={row.index} className="row-block" style={{ width: row.widthPx }}>
-                <div className="row-time-axis" style={{ width: row.widthPx }}>
+              <div key={row.index} className="row-block" style={{ width: laneW }}>
+                <div className="row-time-axis" style={{ width: laneW }}>
                   {makeTicks(row.startSec, row.endSec, sb.pxPerSecond).map((t, i) => (
                     <span key={i} className="tick" style={{ left: (t - row.startSec) * sb.pxPerSecond }}>{t.toFixed(0)}s</span>
                   ))}
                 </div>
 
-                <div className="row-shots" style={{ width: row.widthPx }}>
+                <div className="row-shots">
                   <DropTarget
                     active={draggingShotId !== null && dropIdx === firstShotIndex(sb.shots, row, 0)}
                     onDragEnter={() => setDropIdx(firstShotIndex(sb.shots, row, 0))}
@@ -287,7 +288,7 @@ export default function StoryboardEditor() {
                       setDropIdx(null);
                     }}
                   />
-                  {row.shots.map((rs, i) => {
+                  {row.shots.map((rs) => {
                     const globalIdx = sb.shots.findIndex((s) => s.id === rs.shot.id);
                     return (
                       <div key={rs.shot.id} style={{ display: 'flex' }}>
@@ -314,12 +315,12 @@ export default function StoryboardEditor() {
                   })}
                 </div>
 
-                <div className="lanes" style={{ width: row.widthPx, position: 'relative' }}>
+                <div className="lanes" style={{ width: laneW, position: 'relative' }}>
                   {Array.from({ length: sb.laneCount }).map((_, lane) => (
                     <div
                       key={lane}
                       className="lane"
-                      style={{ width: row.widthPx }}
+                      style={{ width: laneW }}
                       onClick={(e) => createAudioAtClick(row.index, lane, e)}
                     >
                       <span className="lane-label">A{lane + 1}</span>
@@ -417,6 +418,7 @@ function ShotForm({ shot, onChange, onDelete }: {
   onDelete: () => void;
 }) {
   const [uploading, setUploading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
 
   const onFile = async (file: File) => {
     setUploading(true);
@@ -424,6 +426,13 @@ function ShotForm({ shot, onChange, onDelete }: {
       const url = await api.upload(file);
       onChange({ imageUrl: url });
     } finally { setUploading(false); }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files[0];
+    if (file) onFile(file);
   };
 
   return (
@@ -445,21 +454,39 @@ function ShotForm({ shot, onChange, onDelete }: {
       </div>
       <div className="field">
         <label>Reference image</label>
-        {shot.imageUrl && (
-          <div style={{ marginBottom: 8 }}>
-            <img src={shot.imageUrl} style={{ width: '100%', borderRadius: 6, border: '1px solid var(--border)' }} />
-            <button className="btn ghost danger" style={{ marginTop: 6 }} onClick={() => onChange({ imageUrl: null })}>
-              Remove image
+        {shot.imageUrl ? (
+          <div className="upload-preview">
+            <img src={shot.imageUrl} alt="Reference frame" />
+            <button
+              className="upload-preview-remove"
+              onClick={() => onChange({ imageUrl: null })}
+            >
+              Remove
             </button>
           </div>
+        ) : (
+          <div
+            className={`upload-zone${dragOver ? ' drag-over' : ''}${uploading ? ' is-uploading' : ''}`}
+            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={handleDrop}
+          >
+            <span className="upload-zone-icon" aria-hidden="true">↑</span>
+            <span className="upload-zone-label">
+              {uploading ? 'Uploading…' : 'Drop image or click to browse'}
+            </span>
+            {!uploading && <span className="upload-zone-hint">PNG · JPG · WebP</span>}
+            <input
+              type="file"
+              accept="image/*"
+              disabled={uploading}
+              aria-label="Upload reference image"
+              onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); e.target.value = ''; }}
+            />
+          </div>
         )}
-        <input
-          type="file" accept="image/*" disabled={uploading}
-          onChange={(e) => { const f = e.target.files?.[0]; if (f) onFile(f); e.target.value = ''; }}
-        />
-        {uploading && <div className="meta">Uploading…</div>}
       </div>
-      <div style={{ marginTop: 24 }}>
+      <div style={{ marginTop: 'var(--space-lg)' }}>
         <button className="btn danger" onClick={onDelete}>Delete shot</button>
       </div>
     </>

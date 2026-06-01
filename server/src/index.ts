@@ -1,5 +1,6 @@
-import { Hono } from 'hono';
+import { Hono, type MiddlewareHandler } from 'hono';
 import { cors } from 'hono/cors';
+import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { randomUUID } from 'node:crypto';
@@ -9,44 +10,117 @@ import {
   db, UPLOAD_DIR, toStoryboard, toShot, toAudio, touchStoryboard,
   StoryboardRow, ShotRow, AudioRow,
 } from './db.js';
+import { hashPassword, verifyPassword, createSession, getUserBySession, deleteSession } from './auth.js';
 
-const app = new Hono();
-app.use('*', cors());
+type Env = { Variables: { userId: string } };
+const app = new Hono<Env>();
+
+app.use('*', cors({
+  origin: (origin) => origin ?? 'http://localhost:5173',
+  credentials: true,
+}));
 
 app.use('/uploads/*', serveStatic({ root: './data' }));
 
-// ---- Storyboards ----
-app.get('/api/storyboards', (c) => {
-  const rows = db.prepare('SELECT * FROM storyboards ORDER BY updated_at DESC').all() as StoryboardRow[];
+// ── Auth middleware ──────────────────────────────────────
+const requireAuth: MiddlewareHandler<Env> = async (c, next) => {
+  const token = getCookie(c, 'session');
+  if (!token) return c.json({ error: 'unauthorized' }, 401);
+  const user = getUserBySession(token);
+  if (!user) return c.json({ error: 'unauthorized' }, 401);
+  c.set('userId', user.id);
+  await next();
+};
+
+// ── Auth routes ──────────────────────────────────────────
+app.post('/api/auth/register', async (c) => {
+  const { email, password } = await c.req.json().catch(() => ({} as Record<string, string>));
+  if (!email || !password || password.length < 8) {
+    return c.json({ error: 'Email and password (min 8 chars) required' }, 400);
+  }
+  const existing = db.prepare('SELECT id FROM users WHERE email=?').get(email.toLowerCase());
+  if (existing) return c.json({ error: 'Email already registered' }, 409);
+
+  const id = randomUUID();
+  const hash = await hashPassword(password);
+  db.prepare('INSERT INTO users (id,email,password_hash,created_at) VALUES (?,?,?,?)')
+    .run(id, email.toLowerCase(), hash, Date.now());
+
+  const token = createSession(id);
+  setCookie(c, 'session', token, {
+    httpOnly: true, sameSite: 'Lax', path: '/',
+    maxAge: 30 * 24 * 60 * 60,
+  });
+  return c.json({ id, email: email.toLowerCase() });
+});
+
+app.post('/api/auth/login', async (c) => {
+  const { email, password } = await c.req.json().catch(() => ({} as Record<string, string>));
+  if (!email || !password) return c.json({ error: 'Email and password required' }, 400);
+
+  const user = db.prepare('SELECT * FROM users WHERE email=?').get(email.toLowerCase()) as
+    { id: string; email: string; password_hash: string } | undefined;
+  if (!user || !(await verifyPassword(password, user.password_hash))) {
+    return c.json({ error: 'Invalid email or password' }, 401);
+  }
+
+  const token = createSession(user.id);
+  setCookie(c, 'session', token, {
+    httpOnly: true, sameSite: 'Lax', path: '/',
+    maxAge: 30 * 24 * 60 * 60,
+  });
+  return c.json({ id: user.id, email: user.email });
+});
+
+app.post('/api/auth/logout', (c) => {
+  const token = getCookie(c, 'session');
+  if (token) deleteSession(token);
+  deleteCookie(c, 'session', { path: '/' });
+  return c.json({ ok: true });
+});
+
+app.get('/api/auth/me', (c) => {
+  const token = getCookie(c, 'session');
+  if (!token) return c.json({ error: 'unauthorized' }, 401);
+  const user = getUserBySession(token);
+  if (!user) return c.json({ error: 'unauthorized' }, 401);
+  return c.json(user);
+});
+
+// ── Storyboards (auth-gated) ─────────────────────────────
+app.get('/api/storyboards', requireAuth, (c) => {
+  const userId = c.get('userId');
+  const rows = db.prepare('SELECT * FROM storyboards WHERE user_id=? ORDER BY updated_at DESC').all(userId) as StoryboardRow[];
   return c.json(rows.map(toStoryboard));
 });
 
-app.post('/api/storyboards', async (c) => {
+app.post('/api/storyboards', requireAuth, async (c) => {
+  const userId = c.get('userId');
   const body = await c.req.json().catch(() => ({} as any));
   const id = randomUUID();
   const now = Date.now();
   db.prepare(
-    'INSERT INTO storyboards (id,name,px_per_second,row_width_px,lane_count,created_at,updated_at) VALUES (?,?,?,?,?,?,?)'
-  ).run(id, body.name || 'Untitled storyboard', 40, 1100, 3, now, now);
-  const sb = db.prepare('SELECT * FROM storyboards WHERE id=?').get(id) as StoryboardRow;
-  return c.json(toStoryboard(sb));
+    'INSERT INTO storyboards (id,name,px_per_second,row_width_px,lane_count,created_at,updated_at,user_id) VALUES (?,?,?,?,?,?,?,?)'
+  ).run(id, body.name || 'Untitled storyboard', 40, 1100, 3, now, now, userId);
+  return c.json(toStoryboard(db.prepare('SELECT * FROM storyboards WHERE id=?').get(id) as StoryboardRow));
 });
 
-app.get('/api/storyboards/:id', (c) => {
+app.get('/api/storyboards/:id', requireAuth, (c) => {
+  const userId = c.get('userId');
   const id = c.req.param('id');
-  const sb = db.prepare('SELECT * FROM storyboards WHERE id=?').get(id) as StoryboardRow | undefined;
+  const sb = db.prepare('SELECT * FROM storyboards WHERE id=? AND user_id=?').get(id, userId) as StoryboardRow | undefined;
   if (!sb) return c.json({ error: 'not found' }, 404);
   const shots = db.prepare('SELECT * FROM shots WHERE storyboard_id=? ORDER BY "order"').all(id) as ShotRow[];
   const audio = db.prepare('SELECT * FROM audio_markers WHERE storyboard_id=?').all(id) as AudioRow[];
-  return c.json({
-    ...toStoryboard(sb),
-    shots: shots.map(toShot),
-    audioMarkers: audio.map(toAudio),
-  });
+  return c.json({ ...toStoryboard(sb), shots: shots.map(toShot), audioMarkers: audio.map(toAudio) });
 });
 
-app.patch('/api/storyboards/:id', async (c) => {
+app.patch('/api/storyboards/:id', requireAuth, async (c) => {
+  const userId = c.get('userId');
   const id = c.req.param('id');
+  if (!db.prepare('SELECT id FROM storyboards WHERE id=? AND user_id=?').get(id, userId)) {
+    return c.json({ error: 'not found' }, 404);
+  }
   const body = await c.req.json();
   const map: Record<string, string> = {
     name: 'name', pxPerSecond: 'px_per_second', rowWidthPx: 'row_width_px', laneCount: 'lane_count',
@@ -58,33 +132,34 @@ app.patch('/api/storyboards/:id', async (c) => {
   if (!sets.length) return c.json({ ok: true });
   sets.push('updated_at=?'); vals.push(Date.now()); vals.push(id);
   db.prepare(`UPDATE storyboards SET ${sets.join(',')} WHERE id=?`).run(...vals as never[]);
-  const sb = db.prepare('SELECT * FROM storyboards WHERE id=?').get(id) as StoryboardRow;
-  return c.json(toStoryboard(sb));
+  return c.json(toStoryboard(db.prepare('SELECT * FROM storyboards WHERE id=?').get(id) as StoryboardRow));
 });
 
-app.delete('/api/storyboards/:id', (c) => {
-  db.prepare('DELETE FROM storyboards WHERE id=?').run(c.req.param('id'));
+app.delete('/api/storyboards/:id', requireAuth, (c) => {
+  const userId = c.get('userId');
+  const id = c.req.param('id');
+  db.prepare('DELETE FROM storyboards WHERE id=? AND user_id=?').run(id, userId);
   return c.json({ ok: true });
 });
 
-// ---- Shots ----
-app.post('/api/storyboards/:id/shots', async (c) => {
+// ── Shots ────────────────────────────────────────────────
+app.post('/api/storyboards/:id/shots', requireAuth, async (c) => {
+  const userId = c.get('userId');
   const sbId = c.req.param('id');
+  if (!db.prepare('SELECT id FROM storyboards WHERE id=? AND user_id=?').get(sbId, userId)) {
+    return c.json({ error: 'not found' }, 404);
+  }
   const body = await c.req.json().catch(() => ({} as any));
   const id = randomUUID();
   const maxOrder = db.prepare('SELECT COALESCE(MAX("order"), -1) AS m FROM shots WHERE storyboard_id=?').get(sbId) as { m: number };
   db.prepare(
     'INSERT INTO shots (id,storyboard_id,"order",title,description,duration_sec,image_url) VALUES (?,?,?,?,?,?,?)'
-  ).run(
-    id, sbId, maxOrder.m + 1,
-    body.title || '', body.description || '',
-    body.durationSec ?? 3, body.imageUrl || null,
-  );
+  ).run(id, sbId, maxOrder.m + 1, body.title || '', body.description || '', body.durationSec ?? 3, body.imageUrl || null);
   touchStoryboard(sbId);
   return c.json(toShot(db.prepare('SELECT * FROM shots WHERE id=?').get(id) as ShotRow));
 });
 
-app.patch('/api/shots/:id', async (c) => {
+app.patch('/api/shots/:id', requireAuth, async (c) => {
   const id = c.req.param('id');
   const body = await c.req.json();
   const map: Record<string, string> = {
@@ -102,46 +177,44 @@ app.patch('/api/shots/:id', async (c) => {
   return c.json(toShot(shot));
 });
 
-app.delete('/api/shots/:id', (c) => {
+app.delete('/api/shots/:id', requireAuth, (c) => {
   const id = c.req.param('id');
   const shot = db.prepare('SELECT * FROM shots WHERE id=?').get(id) as ShotRow | undefined;
   if (!shot) return c.json({ ok: true });
   db.prepare('DELETE FROM shots WHERE id=?').run(id);
-  // Re-pack order
   const rest = db.prepare('SELECT id FROM shots WHERE storyboard_id=? ORDER BY "order"').all(shot.storyboard_id) as { id: string }[];
   const stmt = db.prepare('UPDATE shots SET "order"=? WHERE id=?');
-  const tx = db.transaction(() => rest.forEach((r, i) => stmt.run(i, r.id)));
-  tx();
+  db.transaction(() => rest.forEach((r, i) => stmt.run(i, r.id)))();
   touchStoryboard(shot.storyboard_id);
   return c.json({ ok: true });
 });
 
-app.put('/api/storyboards/:id/shot-order', async (c) => {
+app.put('/api/storyboards/:id/shot-order', requireAuth, async (c) => {
   const sbId = c.req.param('id');
   const { ids } = await c.req.json() as { ids: string[] };
   const stmt = db.prepare('UPDATE shots SET "order"=? WHERE id=? AND storyboard_id=?');
-  const tx = db.transaction(() => ids.forEach((id, i) => stmt.run(i, id, sbId)));
-  tx();
+  db.transaction(() => ids.forEach((id, i) => stmt.run(i, id, sbId)))();
   touchStoryboard(sbId);
   return c.json({ ok: true });
 });
 
-// ---- Audio markers ----
-app.post('/api/storyboards/:id/audio', async (c) => {
+// ── Audio markers ────────────────────────────────────────
+app.post('/api/storyboards/:id/audio', requireAuth, async (c) => {
+  const userId = c.get('userId');
   const sbId = c.req.param('id');
+  if (!db.prepare('SELECT id FROM storyboards WHERE id=? AND user_id=?').get(sbId, userId)) {
+    return c.json({ error: 'not found' }, 404);
+  }
   const body = await c.req.json();
   const id = randomUUID();
   db.prepare(
     'INSERT INTO audio_markers (id,storyboard_id,lane,start_sec,end_sec,label,color) VALUES (?,?,?,?,?,?,?)'
-  ).run(
-    id, sbId, body.lane ?? 0, body.startSec, body.endSec,
-    body.label || '', body.color || '#7c3aed',
-  );
+  ).run(id, sbId, body.lane ?? 0, body.startSec, body.endSec, body.label || '', body.color || '#7c3aed');
   touchStoryboard(sbId);
   return c.json(toAudio(db.prepare('SELECT * FROM audio_markers WHERE id=?').get(id) as AudioRow));
 });
 
-app.patch('/api/audio/:id', async (c) => {
+app.patch('/api/audio/:id', requireAuth, async (c) => {
   const id = c.req.param('id');
   const body = await c.req.json();
   const map: Record<string, string> = {
@@ -159,7 +232,7 @@ app.patch('/api/audio/:id', async (c) => {
   return c.json(toAudio(a));
 });
 
-app.delete('/api/audio/:id', (c) => {
+app.delete('/api/audio/:id', requireAuth, (c) => {
   const id = c.req.param('id');
   const a = db.prepare('SELECT * FROM audio_markers WHERE id=?').get(id) as AudioRow | undefined;
   db.prepare('DELETE FROM audio_markers WHERE id=?').run(id);
@@ -167,8 +240,8 @@ app.delete('/api/audio/:id', (c) => {
   return c.json({ ok: true });
 });
 
-// ---- Upload ----
-app.post('/api/upload', async (c) => {
+// ── Upload ───────────────────────────────────────────────
+app.post('/api/upload', requireAuth, async (c) => {
   const body = await c.req.parseBody();
   const file = body['file'];
   if (!(file instanceof File)) return c.json({ error: 'no file' }, 400);

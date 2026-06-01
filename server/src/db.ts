@@ -13,6 +13,19 @@ db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS storyboards (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -44,9 +57,16 @@ db.exec(`
   );
 `);
 
+// Migrate: add user_id column to storyboards if not present
+const sbCols = (db.prepare('PRAGMA table_info(storyboards)').all() as { name: string }[]).map(c => c.name);
+if (!sbCols.includes('user_id')) {
+  db.exec('ALTER TABLE storyboards ADD COLUMN user_id TEXT REFERENCES users(id)');
+}
+
+export type UserRow = { id: string; email: string; password_hash: string; created_at: number };
 export type StoryboardRow = {
   id: string; name: string; px_per_second: number; row_width_px: number; lane_count: number;
-  created_at: number; updated_at: number;
+  created_at: number; updated_at: number; user_id: string | null;
 };
 export type ShotRow = {
   id: string; storyboard_id: string; order: number; title: string; description: string;
